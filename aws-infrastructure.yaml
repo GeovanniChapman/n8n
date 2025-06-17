@@ -1,0 +1,385 @@
+# aws cloudformation validate-template --template-body file://bin/aws/cloudformation/ecs.yaml
+AWSTemplateFormatVersion: 2010-09-09
+Description: N8N Server.
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: The VPC ID
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: The subnet IDs for the Load Balancer and ECS tasks
+  Company:
+    Type: String
+    Description: eg home
+  Environment:
+    Type: String
+    Description: develop or production
+    AllowedValues:
+      - develop
+      - production
+  Domain:
+    Type: String
+    Description: The domain name for the DNS record (e.g., example.com)
+  HostedZoneId:
+    Type: String
+    Description: The hosted zone ID for the DNS record
+  CertificateArn:
+    Type: String
+    Description: The ARN of the SSL certificate for the Load Balancer
+
+Mappings: 
+  EnvironmentConfigMap:
+    # https://docs.aws.amazon.com/es_es/AmazonECS/latest/developerguide/task_definition_parameters.html
+    # Keep things at or lower than 50% CPU utilization, for example
+    develop:
+      Cpu: 1024
+      Memory: 2GB
+      ContainerPort: 5678
+      ScalingTargetValue: 50
+      MinCapacity: 1
+      MaxCapacity: 1
+    production:
+      Cpu: 2048
+      Memory: 4GB
+      ContainerPort: 5678
+      ScalingTargetValue: 50
+      MinCapacity: 1
+      MaxCapacity: 2
+
+Conditions:
+  isProductionEnv: !Equals 
+    - !Ref "Environment"
+    - "production"
+  
+Resources:
+
+  # ROLES
+
+  # Execution Role for ECS Task
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Join ['-', [n8n, !Ref Company, !Ref Environment, execution-role]]
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: EFSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - elasticfilesystem:ClientMount
+                  - elasticfilesystem:ClientWrite
+                  - elasticfilesystem:DescribeMountTargets
+                  - elasticfilesystem:DescribeFileSystems
+                Resource: !GetAtt EFSFileSystem.Arn
+
+  # Role for ECS Task Container to communicate to the SSM endpoints and be able to open a ECS Exec session
+  ECSTaskContainerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Join ['-', [n8n, !Ref Company, !Ref Environment, task-role]]
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ExecAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssmmessages:CreateControlChannel
+                  - ssmmessages:CreateDataChannel
+                  - ssmmessages:OpenControlChannel
+                  - ssmmessages:OpenDataChannel
+                Resource: '*'
+  
+    # A role needed for auto scaling
+  
+  # Role for AutoScaling
+  AutoScalingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Join ['-', [n8n, !Ref Company, !Ref Environment, scaling-role]]
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceAutoscaleRole'
+
+  # Security Group for Load Balancer
+  LoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Join ['-', [n8n, !Ref Company, !Ref Environment, load-balancer-sg]]
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+  
+  # Security Group for Container
+  ContainerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Join ['-', [n8n, !Ref Company, !Ref Environment, container-security-group]]
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !FindInMap [EnvironmentConfigMap, !Ref Environment, ContainerPort]
+          ToPort: !FindInMap [EnvironmentConfigMap, !Ref Environment, ContainerPort]
+          SourceSecurityGroupId: !Ref LoadBalancerSecurityGroup
+
+  # Application Load Balancer
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Join ['-', [n8n, !Ref Company, !Ref Environment, balancer]]
+      Subnets: !Ref SubnetIds
+      SecurityGroups:
+        - !Ref LoadBalancerSecurityGroup
+      Scheme: internet-facing
+      LoadBalancerAttributes:
+        - Key: idle_timeout.timeout_seconds
+          Value: 60
+
+  # Target Group
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Join ['-', [n8n, !Ref Company, !Ref Environment, tg]]
+      VpcId: !Ref VpcId
+      Port: !FindInMap [EnvironmentConfigMap, !Ref Environment, ContainerPort]
+      Protocol: HTTP
+      TargetType: ip
+      HealthCheckIntervalSeconds: 30
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 5
+      UnhealthyThresholdCount: 2  
+
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      SslPolicy: ELBSecurityPolicy-2016-08
+      Certificates:
+        - CertificateArn: !Ref CertificateArn  
+  # ECS Cluster
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Join ['-', [n8n, !Ref Company, !Ref Environment, cluster]]
+
+  # ECS Task Definition
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    DependsOn: LogGroup
+    Properties:
+      Family: !Join ['-', [n8n, !Ref Company, !Ref Environment, task-definition]]
+      Cpu: !FindInMap [EnvironmentConfigMap, !Ref Environment, Cpu]
+      Memory: !FindInMap [EnvironmentConfigMap, !Ref Environment, Memory]
+      RuntimePlatform:
+        CpuArchitecture: ARM64
+        OperatingSystemFamily: LINUX
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !Ref ECSTaskExecutionRole
+      TaskRoleArn: !Ref ECSTaskContainerRole
+      ContainerDefinitions:
+        - Name: !Join ['-', [n8n, !Ref Company, !Ref Environment, container]]
+          Image: n8nio/n8n:latest
+          Essential: true
+          PortMappings:
+            - ContainerPort: !FindInMap [EnvironmentConfigMap, !Ref Environment, ContainerPort]
+              Protocol: tcp
+          Environment:
+            - Name: N8N_HOST
+              Value: !Ref DNSRecord
+            - Name: N8N_RUNNERS_ENABLED
+              Value: true
+            - Name: NODE_ENV
+              Value: production
+            - Name: WEBHOOK_URL
+              Value: !Join ['', ['https://', !Ref DNSRecord, /]]
+            - Name: GENERIC_TIMEZONE
+              Value: America/Bogota
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-region: !Ref AWS::Region
+              awslogs-group: !Ref LogGroup
+              awslogs-stream-prefix: ecs
+          MountPoints:
+            - SourceVolume: n8n
+              ContainerPath: /home/node/.n8n
+              ReadOnly: false
+      # https://docs.aws.amazon.com/datasync/latest/userguide/create-efs-location.html
+      Volumes:
+        - Name: n8n
+          EFSVolumeConfiguration:
+            FilesystemId: !Ref EFSFileSystem
+            RootDirectory: /
+            TransitEncryption: ENABLED
+            AuthorizationConfig:
+              AccessPointId: !Ref EFSAccessPoint
+
+  # ECS LogGroup     
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Join ['/', [/n8n, ecs, !Ref Company, !Ref Environment]]
+      RetentionInDays: 30
+
+  # ECS Service
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - Listener
+    Properties: 
+      ServiceName: !Join ['-', [n8n, !Ref Company, !Ref Environment, service]]
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref TaskDefinition
+      # This is key to be able to open a ECS Exec session 
+      EnableExecuteCommand: true
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100 # 0 = Downtime around (30 seconds), 100 = Availability
+        MaximumPercent: 200
+      DesiredCount: 1
+      # This may need to be adjusted if the container takes a while to start up
+      HealthCheckGracePeriodSeconds: 30
+      LaunchType: FARGATE
+      NetworkConfiguration: 
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          SecurityGroups:
+            - !Ref ContainerSecurityGroup
+          Subnets: !Ref SubnetIds
+      LoadBalancers:
+        - TargetGroupArn: !Ref TargetGroup
+          ContainerName: !Join ['-', [n8n, !Ref Company, !Ref Environment, container]]
+          ContainerPort: !FindInMap [EnvironmentConfigMap, !Ref Environment, ContainerPort]
+
+  # Security Group for EFS
+  # This security group is used by the mount targets so
+  # that they will allow inbound NFS connections from
+  # the AWS Fargate tasks that we launch
+  EFSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Join ['-', [n8n, !Ref Company, !Ref Environment, efs-sg]]
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          SourceSecurityGroupId: !Ref ContainerSecurityGroup
+
+  # EFS File System
+  EFSFileSystem:
+    Type: AWS::EFS::FileSystem
+    Properties:
+      LifecyclePolicies:
+        - TransitionToIA: AFTER_7_DAYS
+
+  EFSAccessPoint:
+    Type: AWS::EFS::AccessPoint
+    Properties:
+      FileSystemId: !Ref EFSFileSystem
+      PosixUser:
+        Uid: 1000
+        Gid: 1000
+      RootDirectory:
+        Path: "/n8n"
+        CreationInfo:
+          OwnerUid: 1000
+          OwnerGid: 1000
+          Permissions: "0775"
+
+  # Mount target allows usage of the EFS inside of subnet one
+  EFSMountTargetOne:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref EFSFileSystem
+      SubnetId: !Select [0, !Ref SubnetIds]
+      SecurityGroups: 
+        - !Ref EFSSecurityGroup
+
+  # Mount target allows usage of the EFS inside of subnet two
+  EFSMountTargetTwo:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref EFSFileSystem
+      SubnetId: !Select [1, !Ref SubnetIds]
+      SecurityGroups: 
+        - !Ref EFSSecurityGroup
+
+  # Policy for AutoScaling
+  AutoScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Join ['-', [n8n, !Ref Company, !Ref Environment, scaling-policy]]
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref AutoScalingTarget
+      TargetTrackingScalingPolicyConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+        ScaleInCooldown: 10
+        ScaleOutCooldown: 10
+        # Keep things at or lower than 50% CPU utilization, for example
+        TargetValue: !FindInMap [EnvironmentConfigMap, !Ref Environment, ScalingTargetValue]
+
+  # Auto Scaling Target
+  AutoScalingTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MinCapacity: !FindInMap [EnvironmentConfigMap, !Ref Environment, MinCapacity]
+      MaxCapacity: !FindInMap [EnvironmentConfigMap, !Ref Environment, MaxCapacity]
+      ResourceId: !Join ['/', [service, !Join ['-', [n8n, !Ref Company, !Ref Environment, cluster]], !GetAtt Service.Name]] # ECS service - The resource type is service and the unique identifier is the cluster name and service name. Example: service/my-cluster/my-service.
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+      # "The Amazon Resource Name (ARN) of an AWS Identity and Access Management (IAM) role that allows Application Auto Scaling to modify your scalable target."
+      RoleARN: !GetAtt AutoScalingRole.Arn
+
+  # DNS Record
+  DNSRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref Domain
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt LoadBalancer.DNSName
+        HostedZoneId: !GetAtt LoadBalancer.CanonicalHostedZoneID
+
+Outputs:
+  LoadBalancerDNSName:
+    Description: The DNS name of the load balancer
+    Value: !GetAtt LoadBalancer.DNSName
+  PublicURL:
+    Description: The public URL
+    Value: !Join ['', ['https://', !Ref DNSRecord]]

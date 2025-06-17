@@ -1,10 +1,10 @@
-# n8n with SQLLite
+# n8n with SQLite
 
-Starts n8n with SQLLite as database.
+Starts n8n with SQLite as database.
 
 ## Start
 
-To start n8n with SQLLite simply start docker-compose by executing the following
+To start n8n with SQLite simply start docker-compose by executing the following
 command in the current folder.
 
 **IMPORTANT:** But before you do that change the default users and passwords in the [`.env`](.env) file!
