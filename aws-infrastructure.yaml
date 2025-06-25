@@ -35,14 +35,14 @@ Mappings:
       Cpu: 1024
       Memory: 2GB
       ContainerPort: 5678
-      ScalingTargetValue: 50
+      ScalingTargetValue: 75
       MinCapacity: 1
       MaxCapacity: 1
     production:
       Cpu: 2048
       Memory: 4GB
       ContainerPort: 5678
-      ScalingTargetValue: 50
+      ScalingTargetValue: 75
       MinCapacity: 1
       MaxCapacity: 2
 
