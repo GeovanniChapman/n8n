@@ -35,6 +35,15 @@ deploy_aws_infrastructure() {
     exit 1
 }
 
+
+update_n8n_version() {
+    echo 'Updating...'
+    aws ecs update-service --cluster n8n-$COMPANY-$ENVIRONMENT-cluster --service n8n-$COMPANY-$ENVIRONMENT-service --force-new-deployment --no-cli-pager
+    echo 'Waiting services stable....'
+    time aws ecs wait services-stable --cluster n8n-$COMPANY-$ENVIRONMENT-cluster --services n8n-$COMPANY-$ENVIRONMENT-service
+    exit 1
+}
+
 # Menu
 main_menu() {
   # Define color codes
@@ -49,6 +58,7 @@ main_menu() {
     echo -e "${GREEN}Please select an option:${RESET}"
     echo -e "${CYAN}1. ${YELLOW}Start local${RESET}"
     echo -e "${CYAN}2. ${YELLOW}Deploy in AWS${RESET}"
+    echo -e "${CYAN}3. ${YELLOW}Update n8n Version in AWS${RESET}"
     echo -ne "${BLUE}Enter your choice: ${RESET}"
     read -r choice
     case $choice in
@@ -57,6 +67,9 @@ main_menu() {
         ;;
         2)
           deploy_aws_infrastructure
+        ;;
+        3)
+          update_n8n_version
         ;;
         *)
         echo -e "${RED}Invalid option, please try again.${RESET}"
